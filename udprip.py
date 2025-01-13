@@ -3,6 +3,7 @@ import json
 import socket
 import threading
 import time
+from threading import Event
 
 # Configurações globais
 PORT = 55151
@@ -10,16 +11,17 @@ BUFFER_SIZE = 1024
 
 class Router:
     def __init__(self, address, update_period, startup_file=None):
+        self.update_event = Event()  # Sinalizador para atualizações imediatas
         self.address = address
         self.update_period = update_period
         self.routing_table = {}
         self.neighbors = {}
+        self.last_update_time = time.time()  # Rastreador do último envio de update
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.bind((self.address, PORT))
         self.running = True
         if startup_file:
             self.process_startup_file(startup_file)
-        print("Is running!")
         # Inicia a thread de envio de atualizações
         threading.Thread(target=self.send_updates, daemon=True).start()
         # Inicia a thread de recepção de mensagens
@@ -33,36 +35,43 @@ class Router:
                     if command[0] == 'add':
                         self.add_neighbor(command[1], int(command[2]))
         except FileNotFoundError:
-            print(f"Erro: Arquivo de inicialização '{startup_file}' não encontrado.")
+            print(f"Error:'{startup_file}' not find.")
         except ValueError:
-            print("Erro: Formato inválido no arquivo de inicialização.")
+            print("Error: wrong format.")
 
     def add_neighbor(self, ip, weight):
         self.neighbors[ip] = weight
         self.routing_table[ip] = {'distance': weight, 'next_hop': ip}
-        print(f"Vizinho {ip} adicionado com peso {weight}")
+        self.update_event.set()  # Notifica a thread de envio
 
     def del_neighbor(self, ip):
         if ip in self.neighbors:
             del self.neighbors[ip]
             self.routing_table = {k: v for k, v in self.routing_table.items() if v['next_hop'] != ip}
-            print(f"Vizinho {ip} removido")
+            self.update_event.set()  # Notifica a thread de envio
 
     def send_updates(self):
         while self.running:
+            # Sempre envia updates periodicamente
+            if self.update_event.is_set():
+                self.update_event.clear()  # Reseta o evento após um envio imediato
+            
+            # Envia para todos os vizinhos
             for neighbor in self.neighbors:
                 update_message = {
                     "type": "update",
                     "source": self.address,
                     "destination": neighbor,
                     "distances": {
-                        dest: data['distance'] for dest, data in self.routing_table.items() if data['next_hop'] != neighbor
+                        dest: data['distance'] for dest, data in self.routing_table.items()
                     }
                 }
                 try:
                     self.socket.sendto(json.dumps(update_message).encode(), (neighbor, PORT))
                 except Exception as e:
-                    print(f"Erro ao enviar atualização para {neighbor}: {e}")
+                    print(f"error during send update to {neighbor}: {e}")
+            
+            # Pausa entre envios periódicos
             time.sleep(self.update_period)
 
     def receive_messages(self):
@@ -72,9 +81,7 @@ class Router:
                 message = json.loads(data.decode())
                 self.handle_message(message)
             except json.JSONDecodeError:
-                print("Erro: Mensagem recebida não é um JSON válido.")
-            except Exception as e:
-                print(f"Erro ao receber mensagem: {e}")
+                print("Error: invalid JSON.")
 
     def handle_message(self, message):
         if message['type'] == 'update':
@@ -84,23 +91,31 @@ class Router:
         elif message['type'] == 'trace':
             self.handle_trace(message)
 
+   
     def handle_update(self, message):
         source = message['source']
+        if source not in self.neighbors:
+            return
+        updated = False  # Rastreador de mudanças
         for dest, distance in message['distances'].items():
             new_distance = self.neighbors[source] + distance
             if dest not in self.routing_table or new_distance < self.routing_table[dest]['distance']:
                 self.routing_table[dest] = {'distance': new_distance, 'next_hop': source}
+                updated = True
+        if updated:
+            self.update_event.set()  # Marca para envio imediato
 
     def handle_data(self, message):
         if message['destination'] == self.address:
-            print(f"Mensagem recebida: {message['payload']}")
+            # Exibe apenas o conteúdo do payload no terminal
+            print(f"{message['payload']}")
         else:
             next_hop = self.routing_table.get(message['destination'], {}).get('next_hop')
             if next_hop:
                 try:
                     self.socket.sendto(json.dumps(message).encode(), (next_hop, PORT))
                 except Exception as e:
-                    print(f"Erro ao encaminhar mensagem para {next_hop}: {e}")
+                    print(f"Error during send message to {next_hop}: {e}")
 
     def handle_trace(self, message):
         message['routers'].append(self.address)
@@ -114,14 +129,14 @@ class Router:
             try:
                 self.socket.sendto(json.dumps(response).encode(), (message['source'], PORT))
             except Exception as e:
-                print(f"Erro ao enviar resposta de trace para {message['source']}: {e}")
+                print(f"Error during send trace to {message['source']}: {e}")
         else:
             next_hop = self.routing_table.get(message['destination'], {}).get('next_hop')
             if next_hop:
                 try:
                     self.socket.sendto(json.dumps(message).encode(), (next_hop, PORT))
                 except Exception as e:
-                    print(f"Erro ao encaminhar trace para {next_hop}: {e}")
+                    print(f"Error during send trace to {next_hop}: {e}")
 
     def stop(self):
         self.running = False
@@ -149,32 +164,33 @@ class Router:
                         try:
                             self.socket.sendto(json.dumps(trace_message).encode(), (next_hop, PORT))
                         except Exception as e:
-                            print(f"Erro ao enviar trace para {next_hop}: {e}")
+                            print(f"Error during send trace to {next_hop}: {e}")
                     else:
-                        print(f"Rota para {command[1]} não encontrada.")
+                        print(f"Route {command[1]} not find.")
                 elif command[0] == 'quit':
                     self.stop()
             except ValueError:
-                print("Erro: Comando inválido.")
+                print("Error: command not find.")
             except Exception as e:
-                print(f"Erro no comando: {e}")
+                print(f"Error: command not find {e}")
+
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("Uso: ./router.py <endereço> <intervalo> [startup]")
+        print("Uso: ./router.py <adress> <interval> [startup]")
         sys.exit(1)
     try:
-        address = sys.argv[1]
-        print(f"Endereço: {address}")  # Depuração do endereço
+        address = sys.argv[1]       
         update_period = sys.argv[2]
-        print(f"Intervalo (raw): {update_period}")  # Depuração do valor do intervalo
         # Tenta converter o intervalo para float
         update_period = float(update_period)
         startup_file = sys.argv[3] if len(sys.argv) > 3 else None
         router = Router(address, update_period, startup_file)
+        command_thread = threading.Thread(target=router.command_loop)
+        command_thread.start()
         try:
-                router.command_loop()
+            command_thread.join()  # Espera até que o comando `quit` seja executado
         except KeyboardInterrupt:
-                router.stop()
+            router.stop()
     except ValueError:
-        print("Erro: Intervalo de atualização deve ser um número.")
+        print("Erro: Interval needs be a number.")
         sys.exit(1)
